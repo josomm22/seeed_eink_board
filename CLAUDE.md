@@ -1,4 +1,4 @@
-Seeed studios makes a development board called the XIAO ePaper Display Board - EE02 that is designed to drive an e ink spectra 6 13.3 inch display.  The board is based on the ESP32-s3 chip and supports WiFi and Bluetooth connectivity.
+Seeed studios makes a development board called the XIAO ePaper Display Board - EE02 that is designed to drive an e ink spectra 6 13.3 inch display. The board is based on the ESP32-s3 chip and supports WiFi and Bluetooth connectivity.
 
 The board is relatively new and there is limited documentation and community support available for it. However, Seeed Studio recently published this documentation: https://wiki.seeedstudio.com/getting_started_with_ee02/#getting-started-with-arduino
 
@@ -6,9 +6,7 @@ There is also a github repository that is trying to do the same thing we are in 
 
 Note that in this repository there is also documentation of the 13.3 inch spectra 6 driver: 13_3_E6_eInk_Display_module_Datasheet.pdf
 
-Seeed provides a web app called the SenseCraft HMI platform to communicate with the e ink display. However. we don't want to go through the WebApp to display images, we want to directly hit the api endpoints that the custom firmware that we build in this repository supports.  If you look at the ~/eink repository on this computer, you will see that I have done something similar with the GooDisplay e ink driver board. We used the GooDisplay web app to reverse engineer the api endpoints and then wrote a python script to hit those endpoints directly but the GooDisplay web app was pretty simple.
-
-This repository now contains custom firmware for the ESP32 on the EEO2 board that runs a web client that generates http requests to our custom image server to display images on the 13.3 inch spectra 6 display.  We also have the capability to put the ESP32 to sleep and have it wake up at intervals to update the display.  The ESP32 wakes up, connects to WiFi, makes a request to the image server to get the image to display, displays the image, and then goes back to sleep.  The image server rotates through the various images in folders that use the MAC address of the EEO@ board.  We can manage the images that each screen displays by adding or deleting images from that screen's image folder (named for its MAC address)
+This repository contains custom firmware for the ESP32 on the EE02 board. The image side lives in a separate repository: **frame_server** (https://github.com/josomm22/frame_server), a Node/TypeScript LAN server that pulls photos from Google Photos via the Picker API (or direct upload), processes them for the Spectra 6 panel (resize, tone map, dither, pack), and serves ready-to-display packed framebuffers. The old in-repo Python image server (`image_server.py`) has been removed.
 
 ## Custom Firmware Implementation
 
@@ -17,22 +15,40 @@ We have implemented custom Arduino/PlatformIO firmware in the `firmware/` direct
 ### Architecture
 
 ```
-[Home Server]                    [EE02 Board]
-image_server.py                  Arduino Firmware
+[frame_server]                   [EE02 Board]
+Node server :8765                Arduino Firmware
       │                                │
-      │ GET /image_packed              │
+      │ GET /next.bin                  │
       │◄──────────────────────────────│ (wake from deep sleep)
       │                                │
-      │ Returns packed binary          │
-      │ (960KB, pre-dithered)          │
+      │ Returns one random packed      │
+      │ framebuffer from the queue     │
+      │ (960,000 bytes, nibble4bpp)   │
       │──────────────────────────────►│
       │                                │
+      │                                │ Remap palette indices →
+      │                                │ panel color codes
       │                                │ Display image
       │                                │ (dual-controller SPI)
       │                                │
       │                                │ Deep sleep (15 min default)
       │                                ▼
 ```
+
+The ESP32 wakes up, connects to WiFi, syncs its clock via NTP (for the quiet-hours schedule), fetches `/next.bin` from the frame server, remaps the palette, displays the image, and goes back to sleep. The frame server picks a random image from its queue on each request, so there is no hash/change-detection handshake — every wake during active hours downloads and refreshes.
+
+### Frame Server Protocol
+
+- `GET /next.bin` — returns one random packed framebuffer (`application/octet-stream`, exactly 960,000 bytes) or `404` if the queue is empty (firmware keeps the previous image and goes back to sleep).
+- The firmware sends `X-Device-MAC` and `X-Battery-Voltage` request headers; the server currently ignores them.
+- Photos are queued via the server's web UI: `/pick` (Google Photos picker) or `/upload` (direct upload).
+
+**/next.bin format:**
+- 4-bit per pixel, 2 pixels per byte, high nibble = first pixel; 960,000 bytes total
+- Already in the panel's native scan order (the server pre-rotates via `PANEL_ROTATION = 270` in its `src/imaging/pipeline.ts`): 1600 rows × 600 bytes, where the first 300 bytes of each row belong to the master controller and the last 300 to the slave. The firmware streams the buffer without any transpose.
+- Pixel values are **frame_server palette indices**, order fixed by its `src/imaging/palette.ts` (`aitjcizeSpectra6`): 0=black, 1=white, 2=blue, 3=green, 4=red, 5=yellow. The firmware remaps these to UC8179 hardware codes in `remapPaletteToPanel()` (`firmware/src/main.cpp`).
+- The firmware only decodes the server's default `nibble4bpp` packing (a 720,000-byte response would be `pack3bpp`, which is rejected).
+- Image orientation/mirroring is fixed server-side (`PANEL_ROTATION` / `PANEL_FLIP`), not in the firmware.
 
 ### Display Hardware Details
 
@@ -52,126 +68,49 @@ The 13.3" Spectra 6 display uses dual UC8179 controllers in master/slave configu
 - Battery ADC: GPIO1 (A0) - voltage divider output
 - ADC Enable: GPIO6 (A5) - set HIGH to enable voltage divider, LOW to save power
 
-**Data Format:**
-- 4-bit per pixel (2 pixels per byte)
-- Total buffer: 960,000 bytes
-- Data is transposed during transfer: buffer columns become output rows
-
 ### Files
 
 - `firmware/platformio.ini` - PlatformIO project configuration
-- `firmware/src/config.h` - WiFi credentials and pin definitions
+- `firmware/src/config.h` - WiFi credentials and pin definitions (copy from `config.h.example`)
 - `firmware/src/config_manager.h/.cpp` - Persistent configuration storage (NVS)
 - `firmware/src/config_server.h/.cpp` - Web-based configuration interface
 - `firmware/src/display.h/.cpp` - Spectra 6 display driver (ported from esphome-bigink)
-- `firmware/src/main.cpp` - Main loop: WiFi, fetch, display, deep sleep, config mode
-- `image_server.py` - Flask server with image rotation and `/image_packed` endpoint
-- `.eink_rotation_state.json` - Persisted rotation state (auto-generated, gitignored)
+- `firmware/src/main.cpp` - Main loop: WiFi, NTP, fetch, palette remap, display, deep sleep, config mode
 
 ### Runtime Configuration
 
 The server endpoint is configurable at runtime without reflashing:
 
 **To enter configuration mode:**
-1. Press the reset button twice quickly (within 2 seconds)
+1. Hold Button 1 (GPIO2), press and release reset, keep holding Button 1 for one more second
 2. The device will either:
    - Connect to your WiFi and show its IP address (open in browser)
    - Or create a WiFi network called "EInk-Setup" (connect and go to http://192.168.4.1)
 
 **Configurable settings:**
-- Server host (IP or domain name, e.g., "192.168.86.100" or "myserver.linode.com")
-- Server port
-- Image endpoint path
-- Sleep interval (how often to refresh)
+- Server host (IP or domain name of the frame server)
+- Server port (default 8765)
+- Image endpoint path (default `/next.bin`)
+- Refresh interval (how often to fetch a new image during active hours)
+- Active window start/end hour and timezone offset (quiet hours)
 
-Configuration is stored in NVS (Non-Volatile Storage) and persists across reboots.
+Configuration is stored in NVS (Non-Volatile Storage) and persists across reboots. Defaults live in `firmware/src/config_manager.h`.
+
+### Quiet Hours / Clock
+
+The firmware keeps a local wall-clock schedule (active window + timezone offset). Since the frame server has no time endpoint, the clock is synced via NTP (`pool.ntp.org`, `time.google.com`) after WiFi connects; the ESP32 RTC keeps approximate time through deep sleep, so subsequent wakes don't block on NTP. Outside the active window the device sleeps until the next window start.
 
 ### Building and Flashing
 
-1. Install PlatformIO (VSCode extension or CLI)
-2. Edit `firmware/src/config.h` with your WiFi credentials (WIFI_SSID and WIFI_PASSWORD)
+1. `uv sync` in the repo root installs the PlatformIO CLI (or use your own PlatformIO install)
+2. Copy `firmware/src/config.h.example` to `firmware/src/config.h` and set WIFI_SSID and WIFI_PASSWORD
 3. Optionally edit `firmware/src/config_manager.h` to change default server settings
 4. Connect EE02 board via USB
 5. Build and upload:
    ```bash
    cd firmware
-   pio run -t upload
+   uv run pio run -t upload
    ```
-
-### Running the Image Server
-
-1. Install dependencies: `uv sync`
-2. Create the images directory structure (see Multi-Device Support below)
-3. Run: `uv run python image_server.py`
-4. Server listens on http://0.0.0.0:5000
-
-**Endpoints:**
-- `/image_packed` - Returns 960KB of pre-processed 4bpp binary data (advances to next image)
-- `/hash` - Returns 16-char MD5 hash for change detection
-- `/current` - Returns JSON with current rotation status (all devices or specific device)
-- `/` - Index page with multi-device status overview
-
-All endpoints accept the `X-Device-MAC` header to identify which device is making the request.
-The firmware also sends an `X-Battery-Voltage` header with the current battery voltage (e.g., "3.85").
-
-### Multi-Device Support
-
-The server supports multiple EE02 boards, each with their own image rotation. Devices are identified by their MAC address (sent via `X-Device-MAC` HTTP header).
-
-**Directory Structure:**
-```
-seeed_eink_board/
-├── images/
-│   ├── default/          # Fallback for unknown devices
-│   │   ├── image1.jpg
-│   │   └── image2.png
-│   ├── d0cf1326f7e8/     # Device-specific (MAC without separators)
-│   │   ├── photo1.jpg
-│   │   └── photo2.heic
-│   └── aabbccddeeff/     # Another device
-│       └── ...
-├── image_server.py
-└── .eink_rotation_state.json  # Tracks state per-device
-```
-
-**How it works:**
-1. Each ESP32 sends its MAC address (lowercase, no separators) via the `X-Device-MAC` header
-2. The server looks for a directory named `images/<mac-address>/`
-3. If not found, it falls back to `images/default/`
-4. Each device maintains its own rotation state (current index, last returned image)
-
-**Finding your device's MAC:**
-- Enter configuration mode on the EE02 (hold Button 1 during reset)
-- The configuration page shows the device's MAC address and IP
-- Use this MAC address (without colons, lowercase) as the directory name
-
-**State File Format:**
-```json
-{
-  "d0cf1326f7e8": {
-    "current_index": 3,
-    "last_returned": "image.jpg"
-  },
-  "default": {
-    "current_index": 0,
-    "last_returned": "fallback.png"
-  }
-}
-```
-
-### Image Rotation
-
-The server rotates through images in device-specific or default directories:
-
-- **Supported formats:** `.jpg`, `.jpeg`, `.png`, `.gif`, `.bmp`, `.heic`, `.webp`
-- **HEIC support:** Enabled via `pillow-heif` library (handles iPhone photos directly)
-- **Rotation order:** Alphabetical by filename
-- **Persistence:** Rotation state (per-device) saved to `.eink_rotation_state.json`
-- **Symlinks:** Supported - can link to images stored elsewhere
-- **Fallback:** If device directory doesn't exist, uses `images/default/`; if that's empty, falls back to `image.jpg` in repository root
-- **Dynamic updates:** Directory is scanned on each request, so adding/removing images takes effect immediately
-
-Each request to `/image_packed` advances to the next image in rotation for that specific device.
 
 ### Battery Monitoring
 
@@ -182,26 +121,28 @@ The EE02 board has a voltage divider circuit (same as the EE04 board) that allow
 - **Scaling factor:** 7.16 (voltage divider ratio, from EE04 reference)
 - **Note:** GPIO1 is NOT a button despite earlier assumptions. The three physical keys on the board are on GPIO2, GPIO3, and GPIO5 (matching EE04 layout).
 
-The firmware reads battery voltage once per boot (before WiFi to avoid ADC noise) and sends it to the server via the `X-Battery-Voltage` HTTP header. The server logs voltage levels and displays them on the status page with color coding:
-- **RED:** < 3.3V (low, charge soon)
-- **YELLOW:** 3.3V - 3.7V (OK)
-- **GREEN:** > 3.7V (good)
+The firmware reads battery voltage once per boot (before WiFi to avoid ADC noise) and sends it via the `X-Battery-Voltage` HTTP header. The frame server currently ignores it.
 
 Typical LiPo voltage range: 3.0V (empty) to 4.2V (full). Readings above 4.2V indicate USB power.
 
 ### Color Palette
 
-The Spectra 6 supports 6 colors with these hardware codes:
-- 0x00: Black
-- 0x01: White
-- 0x02: Yellow
-- 0x03: Red
-- 0x05: Blue
-- 0x06: Green
+The Spectra 6 supports 6 colors. Two encodings matter:
+
+| Color  | frame_server palette index | UC8179 hardware code |
+|--------|----------------------------|----------------------|
+| Black  | 0 | 0x00 |
+| White  | 1 | 0x01 |
+| Blue   | 2 | 0x05 |
+| Green  | 3 | 0x06 |
+| Red    | 4 | 0x03 |
+| Yellow | 5 | 0x02 |
+
+`remapPaletteToPanel()` in `firmware/src/main.cpp` converts the former to the latter after download. If frame_server's palette order ever changes, that table must change with it.
 
 ### Reference
+- frame_server (image server this firmware talks to): https://github.com/josomm22/frame_server
 - Seeed documentation: https://wiki.seeedstudio.com/getting_started_with_ee02/#getting-started-with-arduino
 - Seeed GFX library (cloned locally at ~/Seeed_GFX): Contains the official T133A01 display driver. Our init register values and sequences have been verified to match exactly. The library defines this board/display combo as `BOARD_SCREEN_COMBO 510` with `USE_XIAO_EPAPER_DISPLAY_BOARD_EE02`.
 - Display driver based on: https://github.com/acegallagher/esphome-bigink
-- Image processing based on: ~/eink/send_to_display.py (GooDisplay project)
 - Battery ADC circuit based on EE04 documentation: https://wiki.seeedstudio.com/epaper_ee04/

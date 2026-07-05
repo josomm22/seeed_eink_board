@@ -12,17 +12,19 @@
  *
  * Stored configuration:
  *   - Server host (e.g., "192.168.86.100" or "myserver.example.com")
- *   - Server port (e.g., 5000)
- *   - Image endpoint path (e.g., "/image_packed")
+ *   - Server port (e.g., 8765)
+ *   - Image endpoint path (e.g., "/next.bin")
  *   - Refresh interval in minutes
  *   - Active window start/end hour (0-23, local time)
  *   - Local timezone offset from UTC in minutes
  */
 
 // Default values (used on first boot or after NVS reset)
+// The defaults target the frame_server (https://github.com/josomm22/frame_server),
+// which listens on port 8765 and serves packed framebuffers at /next.bin.
 #define DEFAULT_SERVER_HOST "192.168.86.34"
-#define DEFAULT_SERVER_PORT 5000
-#define DEFAULT_IMAGE_ENDPOINT "/image_packed"
+#define DEFAULT_SERVER_PORT 8765
+#define DEFAULT_IMAGE_ENDPOINT "/next.bin"
 #define DEFAULT_SLEEP_MINUTES 15
 #define DEFAULT_ACTIVE_START_HOUR 8
 #define DEFAULT_ACTIVE_END_HOUR 20

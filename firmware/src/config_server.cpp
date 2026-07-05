@@ -203,8 +203,7 @@ String ConfigServer::generateConfigPage() {
     html += R"(</code><br>
         <strong>IP Address:</strong> <code>)";
     html += ipAddress;
-    html += R"(</code><br>
-        <span class="current">Use the MAC address as the folder name on your image server for device-specific images.</span>
+    html += R"(</code>
     </div>
 
     <form action="/save" method="POST">
@@ -228,7 +227,7 @@ String ConfigServer::generateConfigPage() {
             <input type="text" name="endpoint" value=")";
     html += config_.getImageEndpoint();
     html += R"(" required>
-            <span class="current">e.g., /image_packed</span>
+            <span class="current">e.g., /next.bin</span>
         </div>
 
         <div class="form-group">
@@ -260,7 +259,7 @@ String ConfigServer::generateConfigPage() {
             <input type="number" name="timezone_offset" value=")";
     html += String(config_.getTimezoneOffsetMinutes());
     html += R"(" min="-720" max="840" required>
-            <span class="current">Examples: 0=UTC, -300=EST, -480=PST. Server config can override this.</span>
+            <span class="current">Examples: 0=UTC, -300=EST, -480=PST. Used for the local active window.</span>
         </div>
 
         <input type="submit" value="Save Configuration">
@@ -291,10 +290,9 @@ String ConfigServer::generateConfigPage() {
 
     <div class="info" style="margin-top: 30px;">
         <strong>Instructions:</strong><br>
-        1. Enter your image server details above<br>
+        1. Enter your frame server details above (frame_server defaults: port 8765, endpoint /next.bin)<br>
         2. Click "Save Configuration"<br>
-        3. Optional: create a <code>device_config.json</code> file on the image server to override the active window remotely<br>
-        4. Click "Reboot Device" to start normal operation<br><br>
+        3. Click "Reboot Device" to start normal operation<br><br>
         <strong>To re-enter setup mode later:</strong><br>
         Hold Button 1, then press and release reset, and continue holding Button 1 for an additional second
     </div>

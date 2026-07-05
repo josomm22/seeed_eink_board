@@ -22,8 +22,10 @@
  *           1600 pixels wide (full width)
  *
  * Data Format:
- * - 4-bit per pixel (2 pixels per byte)
- * - Data is transposed when sent: buffer columns become output rows
+ * - 4-bit per pixel (2 pixels per byte), UC8179 color codes
+ * - The buffer is stored in the panel's native scan order, matching the
+ *   frame server's /next.bin layout: 1600 rows x 600 bytes, first 300 bytes
+ *   of each row for the master controller, last 300 for the slave
  * - Total buffer size: 960,000 bytes
  */
 
@@ -35,7 +37,8 @@ public:
     bool begin();
 
     // Load pre-packed 4bpp image data directly into buffer
-    // Data should be 960,000 bytes, already in display format
+    // Data should be 960,000 bytes in panel-native scan order with UC8179
+    // color codes (i.e. /next.bin after remapPaletteToPanel)
     void loadImageData(const uint8_t* data, size_t length);
 
     // Display the current buffer contents
@@ -81,9 +84,6 @@ private:
     void slaveCommand(uint8_t cmd);
     void slaveCmdData(uint8_t cmd, const uint8_t* data, size_t len);
     void sendCmdDataWithCS(uint8_t cmd, const uint8_t* data, size_t len);
-
-    // Get pixel value from buffer
-    uint8_t getPixel(uint16_t x, uint16_t y);
 };
 
 // Color codes for the Spectra 6 display

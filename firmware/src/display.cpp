@@ -340,18 +340,17 @@ void Spectra6Display::initializeDisplay() {
 // Data Transfer
 // ============================================================================
 
-uint8_t Spectra6Display::getPixel(uint16_t x, uint16_t y) {
-    size_t byteIdx = ((size_t)y * DISPLAY_WIDTH + x) / 2;
-    uint8_t b = buffer_[byteIdx];
-    return (x & 1) ? (b & 0x0F) : ((b >> 4) & 0x0F);
-}
-
 void Spectra6Display::transferData() {
     Serial.println("Spectra6: Starting data transfer...");
     uint32_t start = millis();
 
-    const uint16_t OUT_ROWS = 1600;   // All buffer columns become output rows
-    const uint16_t OUT_BYTES = 300;   // 600 buffer rows / 2 = 300 bytes per output row
+    // The buffer holds the image in the panel's native scan order (identical
+    // to the frame server's /next.bin layout after color remapping):
+    // 1600 rows of 600 bytes. The first 300 bytes of each row belong to the
+    // master controller, the last 300 bytes to the slave.
+    const uint32_t ROW_BYTES = 600;
+    const uint32_t HALF_ROW_BYTES = 300;
+    const uint32_t NUM_ROWS = 1600;
 
     // CCSET (0xE0) to BOTH controllers
     digitalWrite(PIN_CS_SLAVE, LOW);
@@ -368,7 +367,7 @@ void Spectra6Display::transferData() {
     waitUntilIdle(1000);
     delay(10);
 
-    // === MASTER: All columns, top half of rows (0-599) ===
+    // === MASTER: first half of every row ===
     Serial.println("Spectra6: Sending to MASTER...");
 
     digitalWrite(PIN_CS_SLAVE, HIGH);
@@ -379,30 +378,18 @@ void Spectra6Display::transferData() {
     digitalWrite(PIN_DC, HIGH);
 
     uint32_t masterStart = millis();
-    for (uint16_t outRow = 0; outRow < OUT_ROWS; outRow++) {
-        // Transpose: buffer column becomes output row (with FLIP reversal)
-        uint16_t bufCol = 1599 - outRow;
-
-        for (uint16_t outByte = 0; outByte < OUT_BYTES; outByte++) {
-            // Top half: buffer rows 0-599
-            uint16_t bufRowEven = 2 * outByte;
-            uint16_t bufRowOdd = 2 * outByte + 1;
-
-            uint8_t pixEven = getPixel(bufCol, bufRowEven);
-            uint8_t pixOdd = getPixel(bufCol, bufRowOdd);
-
-            SPI.transfer((pixEven << 4) | pixOdd);
-        }
+    for (uint32_t row = 0; row < NUM_ROWS; row++) {
+        spiWriteArray(buffer_ + row * ROW_BYTES, HALF_ROW_BYTES);
 
         // Feed watchdog periodically
-        if ((outRow & 0xFF) == 0) yield();
+        if ((row & 0xFF) == 0) yield();
     }
 
     digitalWrite(PIN_CS_MASTER, HIGH);
     spiEnd();
     Serial.printf("Spectra6: Master data sent in %lu ms\n", millis() - masterStart);
 
-    // === SLAVE: All columns, bottom half of rows (600-1199) ===
+    // === SLAVE: second half of every row ===
     Serial.println("Spectra6: Sending to SLAVE...");
 
     digitalWrite(PIN_CS_MASTER, HIGH);
@@ -413,23 +400,11 @@ void Spectra6Display::transferData() {
     digitalWrite(PIN_DC, HIGH);
 
     uint32_t slaveStart = millis();
-    for (uint16_t outRow = 0; outRow < OUT_ROWS; outRow++) {
-        // Transpose: buffer column becomes output row (with FLIP reversal)
-        uint16_t bufCol = 1599 - outRow;
-
-        for (uint16_t outByte = 0; outByte < OUT_BYTES; outByte++) {
-            // Bottom half: buffer rows 600-1199
-            uint16_t bufRowEven = 600 + 2 * outByte;
-            uint16_t bufRowOdd = 600 + 2 * outByte + 1;
-
-            uint8_t pixEven = getPixel(bufCol, bufRowEven);
-            uint8_t pixOdd = getPixel(bufCol, bufRowOdd);
-
-            SPI.transfer((pixEven << 4) | pixOdd);
-        }
+    for (uint32_t row = 0; row < NUM_ROWS; row++) {
+        spiWriteArray(buffer_ + row * ROW_BYTES + HALF_ROW_BYTES, HALF_ROW_BYTES);
 
         // Feed watchdog periodically
-        if ((outRow & 0xFF) == 0) yield();
+        if ((row & 0xFF) == 0) yield();
     }
 
     digitalWrite(PIN_CS_SLAVE, HIGH);
