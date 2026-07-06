@@ -93,7 +93,14 @@ The frame server does all image processing (resize, tone mapping, dithering) and
 
 The firmware's only transformation is `remapPaletteToPanel()` in `main.cpp`, which converts those indices to the UC8179 hardware color codes (see table below) before loading the display buffer. Each 600-byte buffer row is split down the middle: the first 300 bytes go to the master controller, the last 300 to the slave.
 
-Every request includes `X-Device-MAC`, `X-Firmware-Version`, and `X-Battery-Voltage` headers. The frame server currently ignores them; they exist for logging and future per-device features.
+Every request includes these headers (the frame server currently ignores them; they exist for logging and future per-device features):
+
+| Header | Value |
+|--------|-------|
+| `X-Device-MAC` | Board MAC, lowercase hex, no separators (e.g. `d0cf1326f7e8`) |
+| `X-Firmware-Version` | Running `FIRMWARE_VERSION` (e.g. `1.0.0`) |
+| `X-Battery-Voltage` | Battery voltage in volts, 2 decimals (omitted if the reading was invalid) |
+| `X-Battery-Percent` | Estimated charge 0-100, from a 1S LiPo discharge curve; ≥4.2V (USB power) reads 100 (omitted if invalid) |
 
 ## OTA Firmware Updates
 

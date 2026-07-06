@@ -40,8 +40,9 @@ RTC_DATA_ATTR int bootCount = 0;
 // re-flashing forever.
 RTC_DATA_ATTR char lastFlashedVersion[33] = {0};
 
-// Battery voltage (read once per boot, sent to server with requests)
+// Battery state (read once per boot, sent to server with requests)
 float batteryVoltage = -1.0;
+int batteryPercent = -1;
 
 // Configuration mode: hold Button 1 during boot for 1 second
 #define CONFIG_BUTTON_HOLD_MS 1000
@@ -111,6 +112,49 @@ float readBatteryVoltage() {
     return voltage;
 }
 
+/**
+ * Estimate battery charge percentage from voltage using a typical 1S LiPo
+ * resting discharge curve (piecewise linear). Voltage under load reads a
+ * little low, so this is an approximation, but good enough for a status
+ * display. Returns 0-100, or -1 for an invalid voltage reading.
+ * Readings at/above 4.2V (usually USB power) report 100.
+ */
+int batteryPercentFromVoltage(float voltage) {
+    if (voltage <= 0) {
+        return -1;
+    }
+
+    static const struct { float v; int pct; } curve[] = {
+        {4.20, 100},
+        {4.10, 90},
+        {4.00, 78},
+        {3.90, 62},
+        {3.80, 45},
+        {3.70, 28},
+        {3.60, 12},
+        {3.50, 5},
+        {3.40, 2},
+        {3.30, 0},
+    };
+    const int points = sizeof(curve) / sizeof(curve[0]);
+
+    if (voltage >= curve[0].v) {
+        return 100;
+    }
+    if (voltage <= curve[points - 1].v) {
+        return 0;
+    }
+
+    for (int i = 1; i < points; i++) {
+        if (voltage >= curve[i].v) {
+            float span = curve[i - 1].v - curve[i].v;
+            float frac = (voltage - curve[i].v) / span;
+            return curve[i].pct + (int)(frac * (curve[i - 1].pct - curve[i].pct) + 0.5f);
+        }
+    }
+    return 0;  // Not reached
+}
+
 void addCommonHeaders(HTTPClient& http) {
     String macAddress = getMACAddressClean();
     http.addHeader("X-Device-MAC", macAddress);
@@ -120,6 +164,9 @@ void addCommonHeaders(HTTPClient& http) {
 
     if (batteryVoltage > 0) {
         http.addHeader("X-Battery-Voltage", String(batteryVoltage, 2));
+    }
+    if (batteryPercent >= 0) {
+        http.addHeader("X-Battery-Percent", String(batteryPercent));
     }
 }
 
@@ -622,6 +669,10 @@ void runNormalMode() {
 
     // Read battery voltage before WiFi (ADC can be noisy during WiFi)
     batteryVoltage = readBatteryVoltage();
+    batteryPercent = batteryPercentFromVoltage(batteryVoltage);
+    if (batteryPercent >= 0) {
+        Serial.printf("Battery: ~%d%%\n", batteryPercent);
+    }
 
     // Connect to WiFi first (needed for NTP and the image fetch)
     if (!connectWiFi()) {

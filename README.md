@@ -251,6 +251,7 @@ NORMAL OPERATION MODE
 ========================================
 
 Battery: ADC=2413, voltage=4.21V
+Battery: ~100%
 Connecting to WiFi: YourNetwork
 .
 Connected! IP: 192....
@@ -385,7 +386,7 @@ seeed_eink_board/
 
 ## Battery Monitoring
 
-The firmware reads battery voltage on each wake cycle via the on-board voltage divider (GPIO1 ADC, enabled by GPIO6) and sends it with every request as the `X-Battery-Voltage` HTTP header, along with `X-Device-MAC` identifying the board. The frame server currently ignores these headers, but they're visible in any HTTP logs and available if the server grows per-device features.
+The firmware reads battery voltage on each wake cycle via the on-board voltage divider (GPIO1 ADC, enabled by GPIO6), estimates the charge percentage from a LiPo discharge curve, and sends both with every request as the `X-Battery-Voltage` and `X-Battery-Percent` HTTP headers, along with `X-Device-MAC` identifying the board and `X-Firmware-Version`. The frame server currently ignores these headers, but they're visible in any HTTP logs and available if the server grows per-device features (e.g. showing battery status on its home page).
 
 ### Voltage Levels
 

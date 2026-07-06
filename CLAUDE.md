@@ -42,7 +42,7 @@ The ESP32 wakes up, connects to WiFi, syncs its clock via NTP (for the quiet-hou
 - `GET /next.bin` — returns one random packed framebuffer (`application/octet-stream`, exactly 960,000 bytes) or `404` if the queue is empty (firmware keeps the previous image and goes back to sleep).
 - `GET /firmware/version` — OTA check (see below); `404` = nothing published, check skipped silently.
 - `GET /firmware/latest.bin` — OTA binary download.
-- The firmware sends `X-Device-MAC`, `X-Firmware-Version`, and `X-Battery-Voltage` request headers; the server currently ignores them.
+- The firmware sends `X-Device-MAC`, `X-Firmware-Version`, `X-Battery-Voltage` (volts, 2 decimals), and `X-Battery-Percent` (integer 0-100, from a LiPo discharge curve; ≥4.2V/USB reads 100) request headers; the server currently ignores them.
 - Photos are queued via the server's web UI: `/pick` (Google Photos picker) or `/upload` (direct upload).
 
 **/next.bin format:**
@@ -132,7 +132,7 @@ The EE02 board has a voltage divider circuit (same as the EE04 board) that allow
 - **Scaling factor:** 7.16 (voltage divider ratio, from EE04 reference)
 - **Note:** GPIO1 is NOT a button despite earlier assumptions. The three physical keys on the board are on GPIO2, GPIO3, and GPIO5 (matching EE04 layout).
 
-The firmware reads battery voltage once per boot (before WiFi to avoid ADC noise) and sends it via the `X-Battery-Voltage` HTTP header. The frame server currently ignores it.
+The firmware reads battery voltage once per boot (before WiFi to avoid ADC noise), converts it to a percentage via a piecewise-linear 1S LiPo discharge curve (`batteryPercentFromVoltage()` in `main.cpp`), and sends both via the `X-Battery-Voltage` and `X-Battery-Percent` HTTP headers. The frame server currently ignores them.
 
 Typical LiPo voltage range: 3.0V (empty) to 4.2V (full). Readings above 4.2V indicate USB power.
 
