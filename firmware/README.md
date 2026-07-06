@@ -5,6 +5,7 @@ Custom firmware for the Seeed Studio XIAO ePaper Display Board (EE02) driving a 
 ## Features
 
 - Fetches a random queued photo from the frame server (`GET /next.bin`) on every wake
+- OTA firmware updates: checks the frame server for a newer published version on every wake and flashes itself
 - Deep sleep between refreshes for battery conservation
 - Quiet hours: skips refreshes outside a configurable local-time window (clock synced via NTP)
 - Runtime configuration via web interface (no reflashing needed)
@@ -92,7 +93,48 @@ The frame server does all image processing (resize, tone mapping, dithering) and
 
 The firmware's only transformation is `remapPaletteToPanel()` in `main.cpp`, which converts those indices to the UC8179 hardware color codes (see table below) before loading the display buffer. Each 600-byte buffer row is split down the middle: the first 300 bytes go to the master controller, the last 300 to the slave.
 
-Every request includes `X-Device-MAC` and `X-Battery-Voltage` headers. The frame server currently ignores them; they exist for logging and future per-device features.
+Every request includes these headers (the frame server currently ignores them; they exist for logging and future per-device features):
+
+| Header | Value |
+|--------|-------|
+| `X-Device-MAC` | Board MAC, lowercase hex, no separators (e.g. `d0cf1326f7e8`) |
+| `X-Firmware-Version` | Running `FIRMWARE_VERSION` (e.g. `1.0.0`) |
+| `X-Battery-Voltage` | Battery voltage in volts, 2 decimals (omitted if the reading was invalid) |
+| `X-Battery-Percent` | Estimated charge 0-100, from a 1S LiPo discharge curve; ≥4.2V (USB power) reads 100 (omitted if invalid) |
+
+## OTA Firmware Updates
+
+On every wake (after WiFi + NTP, before the image fetch — so it also runs on quiet-hours wakes), the firmware checks the frame server for a published firmware version and updates itself if it differs from the running version.
+
+### Server contract (to be implemented in the frame_server repo)
+
+The firmware expects these two endpoints on the same host/port as `/next.bin`:
+
+| Method | Path | Behavior |
+|--------|------|----------|
+| GET | `/firmware/version` | `200 text/plain` with the published version string (1-32 chars, `[0-9A-Za-z._-]`, trailing whitespace OK). `404` when no firmware is published — the firmware then skips the check silently. |
+| GET | `/firmware/latest.bin` | `200 application/octet-stream` with the firmware binary and a correct `Content-Length`. Optionally an `X-Firmware-MD5` response header (32 hex chars) — if present, the firmware verifies the flash against it. |
+
+Update decision: the firmware compares the served version string against its compiled-in `FIRMWARE_VERSION` (`src/version.h`). **Any difference** triggers an update (there is no ordering/semver logic), so publishing an older version rolls devices back — which is a feature.
+
+Requests to both endpoints carry `X-Firmware-Version` (the running version), `X-Device-MAC`, and `X-Battery-Voltage` headers, useful for logging which devices are on which version.
+
+### Update sequence
+
+1. `GET /firmware/version` → differs from running version?
+2. `GET /firmware/latest.bin` → streamed into the inactive OTA app partition via the ESP32 `Update` library (partition table `default_8MB.csv` provides two ~3.3 MB app slots)
+3. MD5 verified (if the server sent `X-Firmware-MD5`), partition activated, reboot
+4. The fresh boot reconnects and fetches the next image with the new firmware — the panel only refreshes once per wake even when an update happens
+
+Any failure (timeout, short read, MD5 mismatch, no space) is logged, the update is aborted, and the device continues its normal image cycle; it retries on the next wake.
+
+### Publishing a release
+
+1. Bump `FIRMWARE_VERSION` in `src/version.h`
+2. Build: `uv run pio run`
+3. Publish `.pio/build/seeed_xiao_esp32s3/firmware.bin` on the frame server under the **same version string** you compiled in
+
+**The published version string must match the binary's compiled-in `FIRMWARE_VERSION`.** If they differ, every wake would see "new version available" and re-flash forever. The firmware defends against this: it remembers the last version it flashed (in RTC memory, surviving deep sleep and the OTA reboot) and refuses to re-flash the same advertised version twice, logging the mismatch instead. A power cycle clears that memory.
 
 ## Monitoring Serial Output
 
@@ -291,6 +333,7 @@ firmware/
     ├── config_server.cpp   # HTTP server for configuration
     ├── display.h           # Display driver interface
     ├── display.cpp         # Spectra 6 display driver
+    ├── version.h           # FIRMWARE_VERSION (bump for each OTA release)
     └── main.cpp            # Main application logic
 ```
 

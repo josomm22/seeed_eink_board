@@ -11,6 +11,7 @@ Replaces the Seeed factory-installed firmware on the EE02 board with custom firm
 3. Displays the image on the 13.3" Spectra 6 e-ink screen
 4. Goes back to sleep to conserve battery (configurable interval)
 5. Skips wakeups during configurable quiet hours (like overnight when no one is seeing the display)
+6. Updates itself over the air: each wake it asks the frame server whether a newer firmware version is published (`GET /firmware/version`) and, if so, downloads `GET /firmware/latest.bin` and flashes it — no USB cable needed after the first flash (see `firmware/README.md` for the endpoint contract and release flow)
 
 The image side lives entirely in the [frame_server](https://github.com/josomm22/frame_server) repository: it pulls photos from Google Photos via the Picker API (or direct upload), dithers them for the Spectra 6 palette, and serves ready-to-display framebuffers. This repository is firmware only.
 
@@ -250,6 +251,7 @@ NORMAL OPERATION MODE
 ========================================
 
 Battery: ADC=2413, voltage=4.21V
+Battery: ~100%
 Connecting to WiFi: YourNetwork
 .
 Connected! IP: 192....
@@ -384,7 +386,7 @@ seeed_eink_board/
 
 ## Battery Monitoring
 
-The firmware reads battery voltage on each wake cycle via the on-board voltage divider (GPIO1 ADC, enabled by GPIO6) and sends it with every request as the `X-Battery-Voltage` HTTP header, along with `X-Device-MAC` identifying the board. The frame server currently ignores these headers, but they're visible in any HTTP logs and available if the server grows per-device features.
+The firmware reads battery voltage on each wake cycle via the on-board voltage divider (GPIO1 ADC, enabled by GPIO6), estimates the charge percentage from a LiPo discharge curve, and sends both with every request as the `X-Battery-Voltage` and `X-Battery-Percent` HTTP headers, along with `X-Device-MAC` identifying the board and `X-Firmware-Version`. The frame server currently ignores these headers, but they're visible in any HTTP logs and available if the server grows per-device features (e.g. showing battery status on its home page).
 
 ### Voltage Levels
 

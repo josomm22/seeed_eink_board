@@ -40,7 +40,9 @@ The ESP32 wakes up, connects to WiFi, syncs its clock via NTP (for the quiet-hou
 ### Frame Server Protocol
 
 - `GET /next.bin` — returns one random packed framebuffer (`application/octet-stream`, exactly 960,000 bytes) or `404` if the queue is empty (firmware keeps the previous image and goes back to sleep).
-- The firmware sends `X-Device-MAC` and `X-Battery-Voltage` request headers; the server currently ignores them.
+- `GET /firmware/version` — OTA check (see below); `404` = nothing published, check skipped silently.
+- `GET /firmware/latest.bin` — OTA binary download.
+- The firmware sends `X-Device-MAC`, `X-Firmware-Version`, `X-Battery-Voltage` (volts, 2 decimals), and `X-Battery-Percent` (integer 0-100, from a LiPo discharge curve; ≥4.2V/USB reads 100) request headers; the server currently ignores them.
 - Photos are queued via the server's web UI: `/pick` (Google Photos picker) or `/upload` (direct upload).
 
 **/next.bin format:**
@@ -75,7 +77,8 @@ The 13.3" Spectra 6 display uses dual UC8179 controllers in master/slave configu
 - `firmware/src/config_manager.h/.cpp` - Persistent configuration storage (NVS)
 - `firmware/src/config_server.h/.cpp` - Web-based configuration interface
 - `firmware/src/display.h/.cpp` - Spectra 6 display driver (ported from esphome-bigink)
-- `firmware/src/main.cpp` - Main loop: WiFi, NTP, fetch, palette remap, display, deep sleep, config mode
+- `firmware/src/version.h` - `FIRMWARE_VERSION` for OTA (bump on each release)
+- `firmware/src/main.cpp` - Main loop: WiFi, NTP, OTA check, fetch, palette remap, display, deep sleep, config mode
 
 ### Runtime Configuration
 
@@ -95,6 +98,14 @@ The server endpoint is configurable at runtime without reflashing:
 - Active window start/end hour and timezone offset (quiet hours)
 
 Configuration is stored in NVS (Non-Volatile Storage) and persists across reboots. Defaults live in `firmware/src/config_manager.h`.
+
+### OTA Firmware Updates
+
+On every wake (after NTP, before the image fetch and the quiet-hours check), the firmware compares its compiled-in `FIRMWARE_VERSION` (`firmware/src/version.h`) against `GET /firmware/version` on the frame server. Any difference (plain string inequality, no semver) triggers a download of `GET /firmware/latest.bin` into the inactive OTA partition (`default_8MB.csv` = two ~3.3MB app slots) via the ESP32 `Update` library, MD5-verified against the optional `X-Firmware-MD5` response header, then reboot.
+
+**Server contract (implemented in the frame_server repo, not here):** `/firmware/version` returns `200 text/plain` with a version string (1-32 chars, `[0-9A-Za-z._-]`) or `404` when nothing is published; `/firmware/latest.bin` returns the binary with correct `Content-Length` and optionally `X-Firmware-MD5` (32 hex chars).
+
+**Release flow:** bump `FIRMWARE_VERSION` in `version.h` → `uv run pio run` → publish `.pio/build/seeed_xiao_esp32s3/firmware.bin` on the server under the same version string. The published version string MUST match the binary's compiled-in version; the firmware records the last flashed version in RTC memory (`lastFlashedVersion`, survives deep sleep and soft reset) and refuses to re-flash the same advertised version twice, so a mismatched upload logs a warning instead of update-looping.
 
 ### Quiet Hours / Clock
 
@@ -121,7 +132,7 @@ The EE02 board has a voltage divider circuit (same as the EE04 board) that allow
 - **Scaling factor:** 7.16 (voltage divider ratio, from EE04 reference)
 - **Note:** GPIO1 is NOT a button despite earlier assumptions. The three physical keys on the board are on GPIO2, GPIO3, and GPIO5 (matching EE04 layout).
 
-The firmware reads battery voltage once per boot (before WiFi to avoid ADC noise) and sends it via the `X-Battery-Voltage` HTTP header. The frame server currently ignores it.
+The firmware reads battery voltage once per boot (before WiFi to avoid ADC noise), converts it to a percentage via a piecewise-linear 1S LiPo discharge curve (`batteryPercentFromVoltage()` in `main.cpp`), and sends both via the `X-Battery-Voltage` and `X-Battery-Percent` HTTP headers. The frame server currently ignores them.
 
 Typical LiPo voltage range: 3.0V (empty) to 4.2V (full). Readings above 4.2V indicate USB power.
 
