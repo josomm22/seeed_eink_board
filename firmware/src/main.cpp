@@ -1,11 +1,13 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <Update.h>
 #include <time.h>
 #include "config.h"
 #include "display.h"
 #include "config_manager.h"
 #include "config_server.h"
+#include "version.h"
 
 #ifndef IMAGE_INITIAL_RESPONSE_TIMEOUT_MS
 #if defined(IMAGE_HTTP_TIMEOUT_MS) && (IMAGE_HTTP_TIMEOUT_MS <= 65535)
@@ -31,6 +33,13 @@ ConfigServer configServer(configManager);
 // Boot count stored in RTC memory (survives deep sleep)
 RTC_DATA_ATTR int bootCount = 0;
 
+// Last OTA version we successfully flashed (survives deep sleep and soft
+// reset, cleared on power-on). If the server still advertises this version
+// but we're not running it, the published binary was built with a different
+// FIRMWARE_VERSION than the published version string - skip instead of
+// re-flashing forever.
+RTC_DATA_ATTR char lastFlashedVersion[33] = {0};
+
 // Battery voltage (read once per boot, sent to server with requests)
 float batteryVoltage = -1.0;
 
@@ -44,6 +53,16 @@ float batteryVoltage = -1.0;
 #define NTP_SERVER_1 "pool.ntp.org"
 #define NTP_SERVER_2 "time.google.com"
 #define NTP_SYNC_TIMEOUT_MS 15000
+
+// OTA update endpoints on the frame server (fixed paths, host/port from config)
+#define FIRMWARE_VERSION_ENDPOINT "/firmware/version"
+#define FIRMWARE_BIN_ENDPOINT "/firmware/latest.bin"
+#define OTA_VERSION_TIMEOUT_MS 10000
+#define OTA_DOWNLOAD_TIMEOUT_MS 60000
+
+String getServerBaseURL() {
+    return "http://" + configManager.getServerHost() + ":" + String(configManager.getServerPort());
+}
 
 /**
  * Get the WiFi MAC address as a clean string (lowercase, no separators).
@@ -96,6 +115,8 @@ void addCommonHeaders(HTTPClient& http) {
     String macAddress = getMACAddressClean();
     http.addHeader("X-Device-MAC", macAddress);
     Serial.printf("Sending X-Device-MAC: %s\n", macAddress.c_str());
+
+    http.addHeader("X-Firmware-Version", FIRMWARE_VERSION);
 
     if (batteryVoltage > 0) {
         http.addHeader("X-Battery-Voltage", String(batteryVoltage, 2));
@@ -304,6 +325,126 @@ void disconnectWiFi() {
 }
 
 /**
+ * Download /firmware/latest.bin and flash it to the inactive OTA partition.
+ * On success this reboots the device and never returns.
+ */
+bool performFirmwareUpdate(const String& newVersion) {
+    String url = getServerBaseURL() + FIRMWARE_BIN_ENDPOINT;
+    Serial.printf("OTA: downloading %s\n", url.c_str());
+
+    HTTPClient http;
+    http.begin(url);
+    http.setTimeout(OTA_DOWNLOAD_TIMEOUT_MS);
+    const char* headerKeys[] = {"X-Firmware-MD5"};
+    http.collectHeaders(headerKeys, 1);
+    addCommonHeaders(http);
+
+    int httpCode = http.GET();
+    if (httpCode != HTTP_CODE_OK) {
+        Serial.printf("OTA: firmware download failed, HTTP code: %d\n", httpCode);
+        http.end();
+        return false;
+    }
+
+    int contentLength = http.getSize();
+    if (contentLength <= 0) {
+        Serial.printf("OTA: invalid firmware size: %d\n", contentLength);
+        http.end();
+        return false;
+    }
+    Serial.printf("OTA: firmware size %d bytes\n", contentLength);
+
+    if (!Update.begin(contentLength)) {
+        Serial.printf("OTA: not enough space: %s\n", Update.errorString());
+        http.end();
+        return false;
+    }
+
+    String md5 = http.header("X-Firmware-MD5");
+    if (md5.length() == 32) {
+        Update.setMD5(md5.c_str());
+        Serial.printf("OTA: verifying against MD5 %s\n", md5.c_str());
+    }
+
+    WiFiClient* stream = http.getStreamPtr();
+    size_t written = Update.writeStream(*stream);
+    http.end();
+
+    if (written != static_cast<size_t>(contentLength)) {
+        Serial.printf("OTA: incomplete write: %u of %d bytes\n", written, contentLength);
+        Update.abort();
+        return false;
+    }
+
+    if (!Update.end()) {
+        Serial.printf("OTA: finalize failed: %s\n", Update.errorString());
+        return false;
+    }
+
+    // Remember what we flashed so a mismatched upload can't loop forever
+    strncpy(lastFlashedVersion, newVersion.c_str(), sizeof(lastFlashedVersion) - 1);
+    lastFlashedVersion[sizeof(lastFlashedVersion) - 1] = '\0';
+
+    Serial.printf("OTA: update to %s flashed successfully - rebooting\n", newVersion.c_str());
+    Serial.flush();
+    disconnectWiFi();
+    delay(100);
+    ESP.restart();
+    return true;  // Not reached
+}
+
+/**
+ * Ask the frame server whether a new firmware version is published and
+ * flash it if so. Any failure is logged and skipped - the device continues
+ * its normal image cycle and will retry on the next wake.
+ */
+void checkForFirmwareUpdate() {
+    String url = getServerBaseURL() + FIRMWARE_VERSION_ENDPOINT;
+
+    HTTPClient http;
+    http.begin(url);
+    http.setTimeout(OTA_VERSION_TIMEOUT_MS);
+    addCommonHeaders(http);
+
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_NOT_FOUND) {
+        // No firmware published on the server - normal, nothing to do
+        http.end();
+        return;
+    }
+    if (httpCode != HTTP_CODE_OK) {
+        Serial.printf("OTA: version check failed, HTTP code: %d\n", httpCode);
+        http.end();
+        return;
+    }
+
+    String serverVersion = http.getString();
+    http.end();
+    serverVersion.trim();
+
+    if (serverVersion.length() == 0 || serverVersion.length() > 32) {
+        Serial.printf("OTA: invalid server version string (%d chars)\n", serverVersion.length());
+        return;
+    }
+
+    if (serverVersion == FIRMWARE_VERSION) {
+        Serial.printf("OTA: firmware up to date (%s)\n", FIRMWARE_VERSION);
+        return;
+    }
+
+    if (strcmp(lastFlashedVersion, serverVersion.c_str()) == 0) {
+        Serial.printf("OTA: already flashed %s but running %s - published binary likely "
+                      "compiled with a different FIRMWARE_VERSION; skipping\n",
+                      serverVersion.c_str(), FIRMWARE_VERSION);
+        return;
+    }
+
+    Serial.printf("OTA: new version %s available (running %s)\n",
+                  serverVersion.c_str(), FIRMWARE_VERSION);
+    performFirmwareUpdate(serverVersion);
+}
+
+/**
  * Convert the frame server's palette indices into UC8179 panel color codes.
  *
  * The server packs pixels as indices into its palette (order fixed by
@@ -493,6 +634,11 @@ void runNormalMode() {
     syncClockNTP();
     printClockStatus();
 
+    // OTA before the image fetch: if an update installs, the device reboots
+    // and displays the next image with the new firmware (single panel
+    // refresh). Runs on quiet-hours wakes too, so updates land overnight.
+    checkForFirmwareUpdate();
+
     if (isClockValid() &&
         !isWithinActiveWindow(time(nullptr),
                               configManager.getActiveStartHour(),
@@ -530,6 +676,7 @@ void setup() {
 
     Serial.println("\n========================================");
     Serial.println("Seeed EE02 E-Ink Display Firmware");
+    Serial.printf("Version: %s\n", FIRMWARE_VERSION);
     Serial.println("========================================");
 
     bootCount++;
