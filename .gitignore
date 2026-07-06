@@ -1,10 +1,6 @@
-# Python-generated files
+# Python-generated files (uv-managed PlatformIO toolchain)
 __pycache__/
 *.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
 
 # Virtual environments
 .venv/
@@ -15,14 +11,6 @@ wheels/
 # Config file with credentials (use config.h.example as template)
 config.h
 
-# User images (users provide their own)
-*.jpg
-*.jpeg
-*.png
-*.JPG
-*.JPEG
-*.PNG
-
 # IDE/editor files
 .vscode/
 .idea/
@@ -32,6 +20,3 @@ config.h
 # OS files
 .DS_Store
 Thumbs.db
-
-# Image server state
-.eink_rotation_state.json

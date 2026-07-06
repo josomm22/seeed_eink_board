@@ -1,20 +1,20 @@
 # EE02 E-Ink Display Firmware
 
-Custom firmware for the Seeed Studio XIAO ePaper Display Board (EE02) driving a 13.3" Spectra 6 e-ink display.
+Custom firmware for the Seeed Studio XIAO ePaper Display Board (EE02) driving a 13.3" Spectra 6 e-ink display. It fetches packed framebuffers from a [frame_server](https://github.com/josomm22/frame_server) instance on your network.
 
 ## Features
 
-- Fetches images from a configurable HTTP server
-- **Hash-based change detection** - only downloads and refreshes when the image changes
+- Fetches a random queued photo from the frame server (`GET /next.bin`) on every wake
 - Deep sleep between refreshes for battery conservation
+- Quiet hours: skips refreshes outside a configurable local-time window (clock synced via NTP)
 - Runtime configuration via web interface (no reflashing needed)
 - Support for the 6-color Spectra 6 palette (Black, White, Yellow, Red, Blue, Green)
 
 ## Prerequisites
 
-- [PlatformIO](https://platformio.org/) (CLI or VSCode extension)
+- [PlatformIO](https://platformio.org/) (CLI or VSCode extension; `uv sync` in the repo root installs the CLI)
 - USB-C cable with data lines (not charge-only)
-- Python 3.x with `uv` for the image server
+- A running [frame_server](https://github.com/josomm22/frame_server) with photos in its queue
 
 ## Quick Start
 
@@ -35,17 +35,19 @@ Edit `src/config.h` and set your WiFi credentials:
 
 ### 2. Set Default Server Address (Optional)
 
-Edit `src/config_manager.h` to set the default image server:
+Edit `src/config_manager.h` to set the default frame server:
 
 ```cpp
-#define DEFAULT_SERVER_HOST "192.168.86.34"  // Your server's IP
-#define DEFAULT_SERVER_PORT 5000
-#define DEFAULT_IMAGE_ENDPOINT "/image_packed"
+#define DEFAULT_SERVER_HOST "192.168.86.34"  // Your frame server's IP
+#define DEFAULT_SERVER_PORT 8765
+#define DEFAULT_IMAGE_ENDPOINT "/next.bin"
 #define DEFAULT_SLEEP_MINUTES 15
 #define DEFAULT_ACTIVE_START_HOUR 8
 #define DEFAULT_ACTIVE_END_HOUR 20
 #define DEFAULT_TIMEZONE_OFFSET_MINUTES 0
 ```
+
+All of these can also be changed at runtime through the configuration web page.
 
 ### 3. Build the Firmware
 
@@ -66,36 +68,31 @@ uv run pio run -t upload --upload-port /dev/ttyACM0
 
 If the device isn't detected, try a different USB cable - many cables are charge-only and lack data lines.
 
-### 5. Start the Image Server
+### 5. Queue Photos on the Frame Server
 
-In the repository root:
-
-```bash
-# Create a symlink to your image
-ln -sf your_image.jpg image.jpg
-
-# Start the server
-uv run python image_server.py
-```
-
-The server runs on `http://0.0.0.0:5000` with these endpoints:
-- `/device_config` - Current epoch time plus optional schedule overrides
-- `/` - Status page with embedded schedule editors
-- `/schedule` - Focused browser UI for editing schedule overrides
-- `/image_packed` - 960KB binary data for the display
-- `/hash` - 16-character hash for change detection
-- `/image` - JPEG preview
+See the [frame_server README](https://github.com/josomm22/frame_server) for server setup. Add photos via `http://your-server:8765/pick` (Google Photos) or `http://your-server:8765/upload` (direct upload).
 
 ### 6. Test
 
 Press the reset button on the EE02 board. The display should:
 1. Connect to WiFi
-2. Sync current time and optional schedule overrides from `/device_config`
+2. Sync the clock via NTP
 3. Skip work and go back to sleep if it is currently in quiet hours
-4. Check the image hash
-5. Download the image (if changed)
-6. Refresh the display (takes 20-30 seconds)
-7. Enter deep sleep
+4. Download a random image from `/next.bin` (960 KB)
+5. Refresh the display (takes 20-30 seconds)
+6. Enter deep sleep
+
+## How the Image Data Flows
+
+The frame server does all image processing (resize, tone mapping, dithering) and serves the result as a packed framebuffer:
+
+- **Size:** exactly 960,000 bytes (1600×1200 pixels, 4 bits per pixel)
+- **Layout:** panel-native scan order — the server pre-rotates the image, so the firmware can stream the buffer to the controllers without transposing
+- **Pixel values:** frame_server palette indices (`0=black 1=white 2=blue 3=green 4=red 5=yellow`)
+
+The firmware's only transformation is `remapPaletteToPanel()` in `main.cpp`, which converts those indices to the UC8179 hardware color codes (see table below) before loading the display buffer. Each 600-byte buffer row is split down the middle: the first 300 bytes go to the master controller, the last 300 to the slave.
+
+Every request includes `X-Device-MAC` and `X-Battery-Voltage` headers. The frame server currently ignores them; they exist for logging and future per-device features.
 
 ## Monitoring Serial Output
 
@@ -149,9 +146,9 @@ Boot count: 1
 Wakeup was not from deep sleep (code: 0)
 ConfigManager: Initialized
 Current Configuration:
-  Server: 192.168.86.34:5000
-  Endpoint: /image_packed
-  Full URL: http://192.168.86.34:5000/image_packed
+  Server: 192.168.86.34:8765
+  Endpoint: /next.bin
+  Full URL: http://192.168.86.34:8765/next.bin
   Refresh interval: 15 minutes
   Active window: 08:00-20:00
   Timezone offset: 0 minutes from UTC
@@ -160,23 +157,21 @@ Current Configuration:
 NORMAL OPERATION MODE
 ========================================
 
+Battery: ADC=2413, voltage=4.21V
 Connecting to WiFi: YourNetwork
 .
 Connected! IP: 192.168.86.24
-Fetching device config from: http://192.168.86.34:5000/device_config
-Clock synchronized from server epoch: 1772290800
+Waiting for NTP time sync...
+Clock synchronized via NTP: 1772290800
 Clock status: utc=1772290800, local=08:00, active_window=yes
-Checking image hash at: http://192.168.86.34:5000/hash
-Last known hash: (none)
-Server hash: 942d3cfc05c8fa41
-Image changed - will download new image
 Spectra6: Initializing display...
 Spectra6: Buffer allocated in PSRAM (960000 bytes)
-Fetching image from: http://192.168.86.34:5000/image_packed
+Fetching image from: http://192.168.86.34:8765/next.bin
+Sending X-Device-MAC: d0cf1326f7e8
 Content length: 960000 bytes
 Downloaded 960000 bytes in 10395 ms
 Spectra6: Starting display refresh...
-Spectra6: Data transfer complete in 3405 ms
+Spectra6: Data transfer complete in 1980 ms
 Spectra6: Sending refresh command (this takes 20-30 seconds)...
 Spectra6: Refresh complete in 28432 ms
 WiFi disconnected
@@ -184,23 +179,20 @@ Entering deep sleep for 15 minutes 0 seconds...
 Going to sleep now...
 ```
 
-When the image hasn't changed:
+When the frame server's queue is empty:
 ```
-Checking image hash at: http://192.168.86.34:5000/hash
-Last known hash: 942d3cfc05c8fa41
-Server hash: 942d3cfc05c8fa41
-Image unchanged - skipping download
-Image unchanged - going back to sleep
+Fetching image from: http://192.168.86.34:8765/next.bin
+Server queue is empty - add photos via the frame server's /pick or /upload page
+Image fetch/display failed!
 WiFi disconnected
 Entering deep sleep for 15 minutes 0 seconds...
 ```
 
 When the device wakes during quiet hours:
 ```
-Fetching device config from: http://192.168.86.34:5000/device_config
-Clock synchronized from server epoch: 1772337600
+Clock already valid - NTP refresh running in background
 Clock status: utc=1772337600, local=21:00, active_window=no
-Currently in quiet hours - skipping hash/image fetch
+Currently in quiet hours - skipping image fetch
 WiFi disconnected
 Outside active window - sleeping until next active start in 39600 seconds
 Entering deep sleep for 660 minutes 0 seconds...
@@ -229,10 +221,10 @@ The device will enter configuration mode and either:
 
 2. Configure these settings:
    - **Server Host**: IP address or domain name (e.g., `192.168.86.34`)
-   - **Server Port**: Usually `5000`
-   - **Image Endpoint**: Path to the image (e.g., `/image_packed`)
+   - **Server Port**: Usually `8765`
+   - **Image Endpoint**: Path to the image (e.g., `/next.bin`)
    - **Refresh Interval**: Minutes between wakeups during active hours (1-1440)
-   - **Active Start Hour**: Local hour when image checks begin (0-23)
+   - **Active Start Hour**: Local hour when refreshes begin (0-23)
    - **Active End Hour**: Local hour when quiet hours begin (0-23)
    - **Timezone Offset**: Minutes from UTC used for local wall-clock scheduling
 
@@ -248,29 +240,6 @@ Settings are stored in NVS (Non-Volatile Storage) and persist across:
 - Power loss
 
 To reset to defaults, use the "Reset Defaults" button in the web interface.
-
-### Remote Schedule Overrides
-
-The image server can override the local schedule by serving `device_config.json`.
-
-- Global override: `device_config.json` in the repository root
-- Default device override: `images/default/device_config.json`
-- Per-device override: `images/<mac-address>/device_config.json`
-
-Example:
-
-```json
-{
-  "refresh_interval_minutes": 60,
-  "active_start_hour": 8,
-  "active_end_hour": 20,
-  "timezone_offset_minutes": -480
-}
-```
-
-Only the keys you include are overridden; everything else stays on the device's locally stored configuration.
-
-If you prefer not to edit JSON by hand, start `image_server.py` and open the main page at `http://your-server:5000/`. It includes embedded schedule editors for the global fallback, the default schedule, and each device that has already contacted the server.
 
 ## Troubleshooting
 
@@ -289,22 +258,24 @@ If you prefer not to edit JSON by hand, start `image_server.py` and open the mai
 
 ### HTTP requests fail (code: -1)
 
-- Verify the server is running: `curl http://your-server:5000/hash`
+- Verify the server is running: `curl -o /dev/null -w "%{http_code}\n" http://your-server:8765/next.bin`
 - Check the server IP address matches your configuration
-- Ensure firewall allows connections on port 5000
+- Ensure firewall allows connections on port 8765
 
 ### Display doesn't refresh
 
 - Check serial output for errors
-- Verify the image server returns valid data: `curl http://localhost:5000/hash`
-- The refresh takes 20-30 seconds, and the server may need extra time to process a large image before the download starts
-- HEIC files often take longer to process than JPEG or PNG
+- A `404` from `/next.bin` means the queue is empty - add photos via the frame server's web UI
+- A content length of `720000` means the server packed in `pack3bpp` format; this firmware only decodes the default `nibble4bpp`
+- The refresh takes 20-30 seconds - this is normal for this panel
 
-### Image appears rotated
+### Image appears rotated or mirrored
 
-The image orientation depends on how you position the display. You can:
-- Rotate the source image before serving
-- Or modify the image processing in `image_server.py`
+Orientation is fixed server-side (`PANEL_ROTATION` / `PANEL_FLIP` in frame_server's `src/imaging/pipeline.ts`). Adjust there, not in the firmware.
+
+### Wrong colors
+
+If colors come out swapped (e.g. blue where yellow should be), the palette-index-to-panel-code table in `remapPaletteToPanel()` (`src/main.cpp`) no longer matches frame_server's palette order. Compare with `src/imaging/palette.ts` in the frame_server repo.
 
 ## File Structure
 
@@ -348,23 +319,23 @@ firmware/
 
 ### Color Codes
 
-| Color | Hardware Code |
-|-------|---------------|
-| Black | 0x00 |
-| White | 0x01 |
-| Yellow | 0x02 |
-| Red | 0x03 |
-| Blue | 0x05 |
-| Green | 0x06 |
+| Color | frame_server index | Hardware Code |
+|-------|--------------------|---------------|
+| Black | 0 | 0x00 |
+| White | 1 | 0x01 |
+| Blue | 2 | 0x05 |
+| Green | 3 | 0x06 |
+| Red | 4 | 0x03 |
+| Yellow | 5 | 0x02 |
 
 ## Power Consumption
 
 - **Active (WiFi + display refresh)**: ~150-200mA
 - **Deep sleep**: ~10µA
 
-For battery operation, increase the sleep interval to maximize battery life. At 15-minute intervals, the device is active for roughly 1 minute per hour.
+For battery operation, increase the sleep interval to maximize battery life. Note that unlike the old hash-based setup, the firmware downloads and refreshes on every wake during active hours (the frame server serves a random image per request), so longer intervals matter more for battery life.
 
 ## Credits
 
+- Image server: [frame_server](https://github.com/josomm22/frame_server)
 - Display driver based on [esphome-bigink](https://github.com/acegallagher/esphome-bigink)
-- Image processing based on the GooDisplay project in `~/eink`

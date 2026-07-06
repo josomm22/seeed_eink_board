@@ -1,8 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <ArduinoJson.h>
-#include <sys/time.h>
 #include <time.h>
 #include "config.h"
 #include "display.h"
@@ -33,23 +31,19 @@ ConfigServer configServer(configManager);
 // Boot count stored in RTC memory (survives deep sleep)
 RTC_DATA_ATTR int bootCount = 0;
 
-// Last image hash stored in RTC memory (survives deep sleep)
-// Used to skip download if image hasn't changed
-RTC_DATA_ATTR char lastImageHash[17] = {0};  // 16 chars + null terminator
-char pendingImageHash[17] = {0};
-
 // Battery voltage (read once per boot, sent to server with requests)
 float batteryVoltage = -1.0;
 
 // Configuration mode: hold Button 1 during boot for 1 second
 #define CONFIG_BUTTON_HOLD_MS 1000
-#define DEVICE_CONFIG_ENDPOINT "/device_config"
 #define MIN_SLEEP_SECONDS 60
 #define VALID_UNIX_TIME 1704067200LL  // 2024-01-01 00:00:00 UTC
 
-String getBaseURL() {
-    return "http://" + configManager.getServerHost() + ":" + String(configManager.getServerPort());
-}
+// NTP servers used to keep the quiet-hours schedule accurate.
+// The frame server has no time endpoint, so the firmware syncs its own clock.
+#define NTP_SERVER_1 "pool.ntp.org"
+#define NTP_SERVER_2 "time.google.com"
+#define NTP_SYNC_TIMEOUT_MS 15000
 
 /**
  * Get the WiFi MAC address as a clean string (lowercase, no separators).
@@ -112,13 +106,6 @@ bool isClockValid(time_t now = time(nullptr)) {
     return now >= VALID_UNIX_TIME;
 }
 
-void setClockFromEpoch(time_t epochSeconds) {
-    struct timeval tv;
-    tv.tv_sec = epochSeconds;
-    tv.tv_usec = 0;
-    settimeofday(&tv, nullptr);
-}
-
 int32_t getLocalSecondsOfDay(time_t utcNow, int16_t timezoneOffsetMinutes) {
     int64_t localSeconds = static_cast<int64_t>(utcNow) + static_cast<int64_t>(timezoneOffsetMinutes) * 60LL;
     int32_t secondsOfDay = static_cast<int32_t>(localSeconds % 86400LL);
@@ -178,7 +165,7 @@ uint32_t secondsUntilWindowEnd(time_t utcNow, uint8_t startHour, uint8_t endHour
 void printClockStatus() {
     time_t now = time(nullptr);
     if (!isClockValid(now)) {
-        Serial.println("Clock status: invalid (no recent server time sync yet)");
+        Serial.println("Clock status: invalid (no NTP sync yet)");
         return;
     }
 
@@ -224,94 +211,27 @@ uint32_t calculateSleepSeconds() {
     return max(untilNextWindow, static_cast<uint32_t>(MIN_SLEEP_SECONDS));
 }
 
-bool syncRemoteConfigAndTime() {
-    String configUrl = getBaseURL() + DEVICE_CONFIG_ENDPOINT;
-    Serial.printf("Fetching device config from: %s\n", configUrl.c_str());
+void syncClockNTP() {
+    configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
 
-    HTTPClient http;
-    http.begin(configUrl);
-    http.setTimeout(HTTP_TIMEOUT_MS);
-    addCommonHeaders(http);
-
-    int httpCode = http.GET();
-    if (httpCode != HTTP_CODE_OK) {
-        Serial.printf("Device config fetch failed, HTTP code: %d\n", httpCode);
-        http.end();
-        return false;
+    if (isClockValid()) {
+        // The RTC keeps (approximate) time through deep sleep; SNTP will
+        // correct any drift in the background without blocking the fetch.
+        Serial.println("Clock already valid - NTP refresh running in background");
+        return;
     }
 
-    String payload = http.getString();
-    http.end();
-
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, payload);
-    if (error) {
-        Serial.printf("Failed to parse device config JSON: %s\n", error.c_str());
-        return false;
+    Serial.println("Waiting for NTP time sync...");
+    uint32_t start = millis();
+    while (!isClockValid() && millis() - start < NTP_SYNC_TIMEOUT_MS) {
+        delay(250);
     }
 
-    if (!doc["server_time_epoch"].is<int64_t>()) {
-        Serial.println("Device config missing server_time_epoch");
-        return false;
+    if (isClockValid()) {
+        Serial.printf("Clock synchronized via NTP: %lld\n", static_cast<long long>(time(nullptr)));
+    } else {
+        Serial.println("NTP sync failed - continuing without valid clock");
     }
-
-    time_t serverEpoch = static_cast<time_t>(doc["server_time_epoch"].as<int64_t>());
-    setClockFromEpoch(serverEpoch);
-    Serial.printf("Clock synchronized from server epoch: %lld\n", static_cast<long long>(serverEpoch));
-
-    uint16_t refreshMinutes = configManager.getSleepMinutes();
-    uint8_t activeStart = configManager.getActiveStartHour();
-    uint8_t activeEnd = configManager.getActiveEndHour();
-    int16_t timezoneOffset = configManager.getTimezoneOffsetMinutes();
-    bool scheduleChanged = false;
-
-    if (doc["refresh_interval_minutes"].is<int>()) {
-        int value = doc["refresh_interval_minutes"].as<int>();
-        if (value > 0 && value <= 1440 && value != refreshMinutes) {
-            refreshMinutes = static_cast<uint16_t>(value);
-            scheduleChanged = true;
-        }
-    }
-
-    if (doc["active_start_hour"].is<int>()) {
-        int value = doc["active_start_hour"].as<int>();
-        if (value >= 0 && value <= 23 && value != activeStart) {
-            activeStart = static_cast<uint8_t>(value);
-            scheduleChanged = true;
-        }
-    }
-
-    if (doc["active_end_hour"].is<int>()) {
-        int value = doc["active_end_hour"].as<int>();
-        if (value >= 0 && value <= 23 && value != activeEnd) {
-            activeEnd = static_cast<uint8_t>(value);
-            scheduleChanged = true;
-        }
-    }
-
-    if (doc["timezone_offset_minutes"].is<int>()) {
-        int value = doc["timezone_offset_minutes"].as<int>();
-        if (value >= -720 && value <= 840 && value != timezoneOffset) {
-            timezoneOffset = static_cast<int16_t>(value);
-            scheduleChanged = true;
-        }
-    }
-
-    if (scheduleChanged) {
-        configManager.setConfig(configManager.getServerHost(),
-                                configManager.getServerPort(),
-                                configManager.getImageEndpoint(),
-                                refreshMinutes,
-                                activeStart,
-                                activeEnd,
-                                timezoneOffset);
-        Serial.println("Applied schedule overrides from server");
-        configManager.printConfig();
-    }
-
-    const char* configSource = doc["config_source"] | "none";
-    Serial.printf("Remote config source: %s\n", configSource);
-    return true;
 }
 
 void printWakeupReason() {
@@ -384,53 +304,34 @@ void disconnectWiFi() {
 }
 
 /**
- * Check if the image on the server has changed by comparing hashes.
+ * Convert the frame server's palette indices into UC8179 panel color codes.
  *
- * @return true if image has changed (or if check failed), false if unchanged
+ * The server packs pixels as indices into its palette (order fixed by
+ * frame_server src/imaging/palette.ts): 0=black 1=white 2=blue 3=green
+ * 4=red 5=yellow. The panel wants 0x00=black 0x01=white 0x02=yellow
+ * 0x03=red 0x05=blue 0x06=green. Remaps both nibbles of every byte in place.
  */
-bool checkImageChanged() {
-    // Build hash endpoint URL from config
-    String hashUrl = getBaseURL() + "/hash";
+void remapPaletteToPanel(uint8_t* buf, size_t len) {
+    static const uint8_t nibbleMap[16] = {
+        0x00,  // 0: black
+        0x01,  // 1: white
+        0x05,  // 2: blue
+        0x06,  // 3: green
+        0x03,  // 4: red
+        0x02,  // 5: yellow
+        // Indices 6-15 never appear in a valid .bin; map them to black,
+        // matching what the server writes for unmatched pixels.
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
 
-    Serial.printf("Checking image hash at: %s\n", hashUrl.c_str());
-    Serial.printf("Last known hash: %s\n", lastImageHash[0] ? lastImageHash : "(none)");
-
-    HTTPClient http;
-    http.begin(hashUrl);
-    http.setTimeout(HTTP_TIMEOUT_MS);
-    addCommonHeaders(http);
-
-    int httpCode = http.GET();
-
-    if (httpCode != HTTP_CODE_OK) {
-        Serial.printf("Hash check failed, HTTP code: %d\n", httpCode);
-        http.end();
-        return true;  // Assume changed if we can't check
+    uint8_t byteMap[256];
+    for (int i = 0; i < 256; i++) {
+        byteMap[i] = (nibbleMap[i >> 4] << 4) | nibbleMap[i & 0x0F];
     }
 
-    String newHash = http.getString();
-    http.end();
-
-    // Validate hash length (should be 16 characters)
-    if (newHash.length() != 16) {
-        Serial.printf("Invalid hash length: %d\n", newHash.length());
-        return true;  // Assume changed if invalid
+    for (size_t i = 0; i < len; i++) {
+        buf[i] = byteMap[buf[i]];
     }
-
-    Serial.printf("Server hash: %s\n", newHash.c_str());
-
-    // Compare with stored hash
-    if (strcmp(newHash.c_str(), lastImageHash) == 0) {
-        Serial.println("Image unchanged - skipping download");
-        pendingImageHash[0] = '\0';
-        return false;  // No change
-    }
-
-    Serial.println("Image changed - will download new image");
-    strncpy(pendingImageHash, newHash.c_str(), 16);
-    pendingImageHash[16] = '\0';
-
-    return true;  // Changed
 }
 
 bool fetchAndDisplayImage() {
@@ -452,6 +353,13 @@ bool fetchAndDisplayImage() {
 
     int httpCode = http.GET();
 
+    if (httpCode == HTTP_CODE_NOT_FOUND) {
+        Serial.println("Server queue is empty - add photos via the frame server's /pick or /upload page");
+        free(imageBuffer);
+        http.end();
+        return false;
+    }
+
     if (httpCode != HTTP_CODE_OK) {
         Serial.printf("HTTP GET failed, code: %d\n", httpCode);
         free(imageBuffer);
@@ -459,20 +367,13 @@ bool fetchAndDisplayImage() {
         return false;
     }
 
-    String responseImageHash = http.header("X-Image-Hash");
-    String responseImageName = http.header("X-Image-Name");
-    String responseDeviceId = http.header("X-Device-ID");
-    if (responseImageName.length() > 0 || responseImageHash.length() > 0 || responseDeviceId.length() > 0) {
-        Serial.printf("Response headers: X-Image-Name=%s, X-Image-Hash=%s, X-Device-ID=%s\n",
-                      responseImageName.length() > 0 ? responseImageName.c_str() : "(none)",
-                      responseImageHash.length() > 0 ? responseImageHash.c_str() : "(none)",
-                      responseDeviceId.length() > 0 ? responseDeviceId.c_str() : "(none)");
-    }
-
     int contentLength = http.getSize();
     Serial.printf("Content length: %d bytes\n", contentLength);
 
-    if (contentLength <= 0 || contentLength > BUFFER_SIZE) {
+    // The frame server must be configured for nibble4bpp packing (its
+    // default). A 720000-byte response would mean pack3bpp, which this
+    // firmware does not decode.
+    if (contentLength != BUFFER_SIZE) {
         Serial.printf("Invalid content length: %d (expected %d)\n", contentLength, BUFFER_SIZE);
         free(imageBuffer);
         http.end();
@@ -517,6 +418,9 @@ bool fetchAndDisplayImage() {
         return false;
     }
 
+    // Convert palette indices to panel color codes
+    remapPaletteToPanel(imageBuffer, bytesRead);
+
     // Load image data into display buffer
     display.loadImageData(imageBuffer, bytesRead);
 
@@ -525,22 +429,6 @@ bool fetchAndDisplayImage() {
 
     // Refresh the display
     display.refresh();
-
-    if (responseImageHash.length() == 16) {
-        strncpy(lastImageHash, responseImageHash.c_str(), 16);
-        lastImageHash[16] = '\0';
-    } else if (pendingImageHash[0] != '\0') {
-        strncpy(lastImageHash, pendingImageHash, 16);
-        lastImageHash[16] = '\0';
-    }
-
-    if (pendingImageHash[0] != '\0' && responseImageHash.length() == 16 &&
-        strcmp(pendingImageHash, responseImageHash.c_str()) != 0) {
-        Serial.printf("Warning: pending hash %s did not match response hash %s\n",
-                      pendingImageHash, responseImageHash.c_str());
-    }
-    pendingImageHash[0] = '\0';
-    Serial.printf("Committed displayed image hash: %s\n", lastImageHash[0] ? lastImageHash : "(none)");
 
     return true;
 }
@@ -594,7 +482,7 @@ void runNormalMode() {
     // Read battery voltage before WiFi (ADC can be noisy during WiFi)
     batteryVoltage = readBatteryVoltage();
 
-    // Connect to WiFi first (needed for hash check)
+    // Connect to WiFi first (needed for NTP and the image fetch)
     if (!connectWiFi()) {
         Serial.println("WiFi connection failed!");
         // Keep previous image, just go to sleep
@@ -602,7 +490,7 @@ void runNormalMode() {
         enterDeepSleep(calculateSleepSeconds());
     }
 
-    syncRemoteConfigAndTime();
+    syncClockNTP();
     printClockStatus();
 
     if (isClockValid() &&
@@ -610,19 +498,12 @@ void runNormalMode() {
                               configManager.getActiveStartHour(),
                               configManager.getActiveEndHour(),
                               configManager.getTimezoneOffsetMinutes())) {
-        Serial.println("Currently in quiet hours - skipping hash/image fetch");
+        Serial.println("Currently in quiet hours - skipping image fetch");
         disconnectWiFi();
         enterDeepSleep(calculateSleepSeconds());
     }
 
-    // Check if image has changed before downloading
-    if (!checkImageChanged()) {
-        Serial.println("Image unchanged - going back to sleep");
-        disconnectWiFi();
-        enterDeepSleep(calculateSleepSeconds());
-    }
-
-    // Image has changed - initialize display and update
+    // Initialize display and fetch the next image from the frame server
     if (!display.begin()) {
         Serial.println("Display initialization failed!");
         disconnectWiFi();

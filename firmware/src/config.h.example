@@ -6,15 +6,17 @@
 #define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 
-// Image Server Configuration
-// NOTE: These are now configurable at runtime via the web interface!
+// Frame Server Configuration
+// The firmware fetches packed framebuffers from the frame_server
+// (https://github.com/josomm22/frame_server).
+// NOTE: These are configurable at runtime via the web interface!
 // These values are only used as initial defaults on first boot.
 // To change the server, hold Button 1 (GPIO2) during boot to enter config mode.
 //
 // Default values are defined in config_manager.h:
 //   DEFAULT_SERVER_HOST "192.168.86.100"
-//   DEFAULT_SERVER_PORT 5000
-//   DEFAULT_IMAGE_ENDPOINT "/image_packed"
+//   DEFAULT_SERVER_PORT 8765
+//   DEFAULT_IMAGE_ENDPOINT "/next.bin"
 //   DEFAULT_SLEEP_MINUTES 15
 
 // Display Pin Configuration (EE02 Board)
@@ -42,13 +44,9 @@
 #define DISPLAY_HEIGHT  1200
 #define BUFFER_SIZE     960000  // (1600 * 1200) / 2 bytes (4bpp)
 
-// HTTP timeout for control requests like /hash and /device_config (in milliseconds)
-#define HTTP_TIMEOUT_MS 30000
-
-// How long to wait for /image_packed to start responding (in milliseconds).
-// The server may need extra time to process the next image before it can start
-// streaming the 960KB body. Keep this <= 65535 because HTTPClient::setTimeout()
-// takes a 16-bit millisecond value in this environment.
+// How long to wait for /next.bin to start responding (in milliseconds).
+// Keep this <= 65535 because HTTPClient::setTimeout() takes a 16-bit
+// millisecond value in this environment.
 #define IMAGE_INITIAL_RESPONSE_TIMEOUT_MS 60000
 
 // How long to tolerate no incoming image bytes once the transfer is underway.
